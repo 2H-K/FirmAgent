@@ -6,25 +6,29 @@ import requests
 import logging
 import time
 import os
+import datetime
 from urllib.parse import urljoin
 import argparse
 from typing import List, Dict, Any, Tuple
 
 
 class APIFuzzer:
-    def __init__(self, base_url: str, json_file: str, delay: float = 1.0, target_host: str = "", taint_tag: str = "taint_tag"):
+    def __init__(self, base_url: str, json_file: str, delay: float = 1.0, target_host: str = "", taint_tag: str = "taint_tag", tag_mode: str = "constant"):
         """
         Initialize API Fuzzer.
         :param base_url: Base API URL (e.g., http://192.168.0.1)
         :param json_file: Path to the JSON file containing API definitions
         :param delay: Delay between requests (seconds)
+        :param tag_mode: 'constant' (default) or 'unique' â€” unique injects {tag}_{seq} per request
         """
         self.base_url = base_url.rstrip('/')
         self.json_file = json_file
         self.delay = delay
         self.target_host = target_host
         self.taint_tag = taint_tag
+        self.tag_mode = tag_mode
         self.session = requests.Session()
+        self._request_counter = 0
 
         # Configure logging
         logging.basicConfig(
@@ -60,6 +64,20 @@ class APIFuzzer:
         with open(result_path, 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
 
+    def _resolve_stream_path(self) -> str:
+        """Resolve ndjson stream path next to result.json."""
+        input_dir = os.path.dirname(os.path.abspath(self.json_file))
+        return os.path.join(input_dir, "result_stream.ndjson")
+
+    def _append_stream_entry(self, entry: Dict[str, Any]) -> None:
+        """Append a single result entry to the ndjson stream (immediate flush)."""
+        stream_path = getattr(self, '_stream_path', None)
+        if stream_path is None:
+            stream_path = self._resolve_stream_path()
+            self._stream_path = stream_path
+        with open(stream_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
     def load_targets(self) -> Tuple[List[str], List[str]]:
         """Load target APIs and parameters from JSON file.
 
@@ -93,7 +111,7 @@ class APIFuzzer:
                 self.logger.error("No api_endpoints found in input JSON")
                 return [], []
 
-            # È¥ÖØ²¢±£³ÖË³Ðò
+            # È¥ï¿½Ø²ï¿½ï¿½ï¿½ï¿½ï¿½Ë³ï¿½ï¿½
             dedup_apis = list(dict.fromkeys(api_endpoints))
             dedup_para = list(dict.fromkeys(parameters))
             return dedup_apis, dedup_para
@@ -101,11 +119,14 @@ class APIFuzzer:
             self.logger.error(f"Failed to load JSON file: {e}")
             return [], []
 
-    def build_taint_payload(self, parameters: List[str], taint_param: str) -> Dict[str, str]:
+    def build_taint_payload(self, parameters: List[str], taint_param: str, request_id: int = 0) -> Dict[str, str]:
         """Build payload with all parameters present; only one parameter is tainted per request."""
         payload = {param: "" for param in parameters}
         if taint_param in payload:
-            payload[taint_param] = self.taint_tag
+            if self.tag_mode == "unique":
+                payload[taint_param] = f"{self.taint_tag}_{request_id}"
+            else:
+                payload[taint_param] = self.taint_tag
         return payload
 
     def send_request(self, api_url: str, payload: Dict[str, str], method: str = "POST") -> Dict[str, Any]:
@@ -190,10 +211,17 @@ class APIFuzzer:
         results: List[Dict[str, Any]] = []
 
         if not parameters:
+            self._request_counter += 1
+            rid = self._request_counter
+            sent_at = datetime.datetime.utcnow().isoformat() + "Z"
             payload = {}
             response_data = self.send_request(api_url, payload, method)
+            received_at = datetime.datetime.utcnow().isoformat() + "Z"
             analysis = self.analyze_response(response_data)
             result = {
+                'request_id': rid,
+                'sent_at': sent_at,
+                'received_at': received_at,
                 'api_url': api_url,
                 'method': method.upper(),
                 'taint_param': None,
@@ -203,24 +231,33 @@ class APIFuzzer:
                 'analysis': analysis
             }
             results.append(result)
+            self._append_stream_entry(result)
             time.sleep(self.delay)
             return results
 
         for param in parameters:
-            payload = self.build_taint_payload(parameters, param)
+            self._request_counter += 1
+            rid = self._request_counter
+            sent_at = datetime.datetime.utcnow().isoformat() + "Z"
+            payload = self.build_taint_payload(parameters, param, rid)
             response_data = self.send_request(api_url, payload, method)
+            received_at = datetime.datetime.utcnow().isoformat() + "Z"
             analysis = self.analyze_response(response_data)
 
             result = {
+                'request_id': rid,
+                'sent_at': sent_at,
+                'received_at': received_at,
                 'api_url': api_url,
                 'method': method.upper(),
                 'taint_param': param,
-                'taint_tag': self.taint_tag,
+                'taint_tag': payload.get(param, self.taint_tag),
                 'post_payload': payload,
                 'response': response_data,
                 'analysis': analysis
             }
             results.append(result)
+            self._append_stream_entry(result)
 
             if analysis['potential_issue']:
                 self.logger.warning(f"[!] Potential issue on {api_url} param {param}: {analysis['issue_type']}")
@@ -240,6 +277,13 @@ class APIFuzzer:
         """
         result_path = self._resolve_result_path()
         self.logger.info(f"Result file will be written to: {result_path}")
+
+        # Initialize stream file (truncate if exists)
+        stream_path = self._resolve_stream_path()
+        self._stream_path = stream_path
+        with open(stream_path, 'w', encoding='utf-8') as f:
+            pass  # truncate
+        self.logger.info(f"Stream file will be written to: {stream_path}")
 
         api_endpoints, parameters = self.load_targets()
         all_results: List[Dict[str, Any]] = []
@@ -283,6 +327,8 @@ def main():
     parser.add_argument("--host", required=True, help="Host header value (IP or domain)")
     parser.add_argument("--method", default="POST", choices=["GET", "POST", "PUT"], help="HTTP method used for all API requests")
     parser.add_argument("--taint-tag", default="taint_tag", help="Tag string injected to every parameter")
+    parser.add_argument("--tag-mode", default="constant", choices=["constant", "unique"],
+                        help="'constant' (default): same tag for all requests; 'unique': {tag}_{seq} per request")
     args = parser.parse_args()
 
     if args.host.startswith("http://") or args.host.startswith("https://"):
@@ -292,7 +338,7 @@ def main():
         base_url = f"http://{args.host}"
         host_header = args.host
 
-    fuzzer = APIFuzzer(base_url, args.json_file, args.delay, host_header, args.taint_tag)
+    fuzzer = APIFuzzer(base_url, args.json_file, args.delay, host_header, args.taint_tag, args.tag_mode)
     fuzzer.method = args.method
     fuzzer.run_fuzzing()
 

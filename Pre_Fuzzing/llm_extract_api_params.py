@@ -132,7 +132,11 @@ def call_chatanywhere(
     timeout: int,
     temperature: float,
 ) -> str:
-    url = f"{base_url.rstrip('/')}/chat/completions"
+    normalized_base_url = base_url.rstrip("/")
+    if normalized_base_url.endswith("/chat/completions"):
+        url = normalized_base_url
+    else:
+        url = f"{normalized_base_url}/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -428,8 +432,16 @@ def main() -> int:
     parser.add_argument("--input", required=True, help="待分析文件或目录路径（支持 export-for-ai-* 目录）")
     parser.add_argument("--output", required=True, help="输出JSON文件路径")
     parser.add_argument("--api-key", default=os.getenv("Private_API_KEY", ""), help="API Key，默认读取环境变量 Private_API_KEY")
-    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="LLM API Base URL")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="模型名")
+    parser.add_argument(
+        "--base-url",
+        default=os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL),
+        help="LLM API Base URL（默认读取 LLM_BASE_URL）",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("LLM_MODEL", DEFAULT_MODEL),
+        help="模型名（默认读取 LLM_MODEL）",
+    )
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="分析提示词")
     parser.add_argument("--max-chars", type=int, default=32000, help="单次请求分块最大字符数（可被 --token-limit 覆盖）")
     parser.add_argument("--overlap-chars", type=int, default=1000, help="相邻分块重叠字符数")
@@ -453,7 +465,7 @@ def main() -> int:
         return 2
 
     if not args.api_key:
-        print("[-] 缺少API Key，请通过 --api-key 或环境变量 CHATANYWHERE_API_KEY 提供", file=sys.stderr)
+        print("[-] 缺少 API Key，请通过 --api-key 或环境变量 Private_API_KEY 提供", file=sys.stderr)
         return 2
 
     files = select_input_files(input_path)

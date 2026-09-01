@@ -9,6 +9,17 @@ import subprocess
 
 from abc import ABC, abstractmethod
 
+
+def apply_llm_environment_overrides(client):
+    """Allow one deployment-wide endpoint and model override for LLM clients."""
+    base_url = os.environ.get("LLM_BASE_URL")
+    model = os.environ.get("LLM_MODEL")
+    if base_url:
+        client.model_url = base_url.rstrip("/")
+    if model:
+        client.model = model
+    return client
+
 class LLMInterface(ABC):
     def __init__(self, logger):
         self.logger = logger
@@ -48,6 +59,8 @@ class LLMAPITwo(LLMInterface):
             self.model_url = "https://api.moonshot.cn/v1/chat/completions"
             self.model = "moonshot-v1-8k"
             self.api_key = os.environ["Private_API_KEY"]
+
+        apply_llm_environment_overrides(self)
             
         self.alert_content = """
             As an expert in program analysis and taint analysis, your task is to analyze the given code snippet and determine if there is a direct data flow between the specified {source} and {sink} variables. {parameter}. When analyzing taint propagation, distinguish between two scenarios:
@@ -342,15 +355,15 @@ If all alerts are false positives: [] (empty list)
 class LLMAPIThree(LLMInterface):
     def __init__(self, logger, model_flag, type, binary):
         super().__init__(logger)
-        if model_flag == "R1_official":
-            self.model_url = "https://api.deepseek.com/chat/completions"
-            self.model = "deepseek-reasoner"
-            self.api_key = os.environ["Private_API_KEY"]
+        # Environment variables are the normal configuration interface.
+        # model_flag is retained only as a legacy fallback selector.
+        self.model_url = "https://api.deepseek.com/chat/completions"
+        self.model = "deepseek-reasoner"
+        self.api_key = os.environ["Private_API_KEY"]
         if model_flag == "V3_official":
-            self.model_url = "https://api.deepseek.com/chat/completions"
             self.model = "deepseek-chat"
-            self.api_key = os.environ["Private_API_KEY"]
-            
+
+        apply_llm_environment_overrides(self)
             
         self.binary_dir = os.path.dirname(binary)
         self.binary = binary
@@ -513,4 +526,4 @@ If it is a false positive, return [].
         print("None")
 
     def crossfunc_taint_agent(self, prompt):
-        print("None") 
+        print("None")

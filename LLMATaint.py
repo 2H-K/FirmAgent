@@ -215,8 +215,13 @@ def argsparse():
     parser.add_argument("-o", "--output", required=True, metavar="/root/output",
                         help="Folder for output results")
 
-    parser.add_argument("-m", "--model", required=True, metavar="deepseek",
-                        help="LLM model")
+    parser.add_argument(
+        "-m",
+        "--model",
+        required=False,
+        choices=["R1_official", "V3_official"],
+        help="Legacy fallback selector; normally configure LLM_MODEL instead",
+    )
     
     parser.add_argument("-e", "--extract", required=False, action="store_true",
                         help="static extract")
@@ -388,12 +393,16 @@ def main():
                 else:
                     subprocess.run([idat_bin, "-A", "-Lida.log", f"-SGetPseudocode.py {args.type}", args.bin], check=True)
 
-            #vuls_scanner.LLM_analysis_FourRole(args.output, args.type, args.model)
-            vuls_scanner.LLM_analysis(args.output, args.type, args.model, args.bin)
+            model_route = args.model or "R1_official"
+            model_label = os.environ.get("LLM_MODEL") or model_route
+            # Model IDs like "org/model" contain slashes - keep them out of file paths
+            model_label = str(model_label).replace("/", "_")
+            #vuls_scanner.LLM_analysis_FourRole(args.output, args.type, model_route)
+            vuls_scanner.LLM_analysis(args.output, args.type, model_route, args.bin)
             end_time = time.time()
             print(f"Analysis time is {int((end_time - start_time)/60)}")
-            with open(f"{args.output}/vuln_{os.path.basename(bin_dir)}_{args.type}_{args.model}.md",'a') as vuln_file:
-                vuln_file.write(f"The potential_paths length is {len(vuls_scanner.potential_paths)}\nAnalysis time is {int((end_time - start_time)/60)}m")           
+            with open(f"{args.output}/vuln_{os.path.basename(bin_dir)}_{args.type}_{model_label}.md",'a') as vuln_file:
+                vuln_file.write(f"The potential_paths length is {len(vuls_scanner.potential_paths)}\nAnalysis time is {int((end_time - start_time)/60)}m")
 
 if __name__ == "__main__":
     main()

@@ -2,3 +2,7 @@
 ida*.log
 old*
 __pycache__
+paper
+AGENTS.md
+CLAUDE.md
+e2e

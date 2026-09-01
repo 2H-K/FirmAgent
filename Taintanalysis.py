@@ -123,7 +123,9 @@ class LLManalysis():
     def loggerfile(self, output, model, sink_type):
         logger = logging.getLogger(__name__)
         logger.setLevel(logging.DEBUG)
-        file_handler = logging.FileHandler(f"{output}/debug_{os.path.basename(self.bin_dir)}_{sink_type}_{model}.log", mode='a')
+        # Model IDs like "org/model" contain slashes — keep them out of file paths
+        safe_model = str(model).replace("/", "_")
+        file_handler = logging.FileHandler(f"{output}/debug_{os.path.basename(self.bin_dir)}_{sink_type}_{safe_model}.log", mode='a')
         file_handler.setLevel(logging.DEBUG)
         formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(formatter)
@@ -519,7 +521,10 @@ class LLManalysis():
                  
                          
     def LLM_analysis(self, directory, sink_type, model_flag, binary):
-        logger = self.loggerfile(directory, model_flag, sink_type)
+        model_label = os.environ.get("LLM_MODEL") or model_flag or "deepseek-reasoner"
+        # Model IDs like "org/model" contain slashes — keep them out of file paths
+        model_label = str(model_label).replace("/", "_")
+        logger = self.loggerfile(directory, model_label, sink_type)
         json_file = self.bin_dir + f'/code_{sink_type}.json'
         with open(json_file, 'r') as f:
             data = json.load(f)
@@ -663,7 +668,7 @@ Do not generate a PoC packet in this stage.
                     if vuln_info:
                         poc = self.extract_poc(vuln_content)
                         self.sink_function_analysis_flags.append(potential_path.sink_caller_function_addr)
-                        with open(f"{directory}/vuln_{os.path.basename(self.bin_dir)}_{sink_type}_{model_flag}.md", 'a') as vuln_file:
+                        with open(f"{directory}/vuln_{os.path.basename(self.bin_dir)}_{sink_type}_{model_label}.md", 'a') as vuln_file:
                             vuln_file.write(f"{vuln_info}\n{poc}\n\n")
                         print(f'{vuln_info}\n{poc}\n')
                 else:
@@ -681,7 +686,7 @@ Do not generate a PoC packet in this stage.
                     
             logger.debug("\n-----------------A potential path has analyzed-----------------------\n\n")
         
-        with open(f"{directory}/vuln_{os.path.basename(self.bin_dir)}_{sink_type}_{model_flag}.md",'a') as vuln_file:
+        with open(f"{directory}/vuln_{os.path.basename(self.bin_dir)}_{sink_type}_{model_label}.md",'a') as vuln_file:
             vuln_file.write(f"Send {prompt_count} prompts\n")                              
         print("Send {} prompts".format(prompt_count))                        
                             
