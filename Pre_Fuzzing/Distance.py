@@ -226,31 +226,183 @@ def _compute_scores_by_paper(
     return rows, w
 
 
-def _write_score_table(output_dir: str, rows: List[Dict[str, float]]) -> Tuple[str, str]:
+def _load_cfg(path: str):
+    """Load sink_cfg.json (schema v1) into (nodes, edges, roots, sinks).
+
+    Returns a dict with keyed structures or None if the file cannot be read.
+    """
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as file:
+        cfg = json.load(file)
+
+    if not isinstance(cfg, dict) or "nodes" not in cfg:
+        return None
+
+    node_by_addr = {int(n["address"]): n for n in cfg["nodes"]}
+    edges = []
+    for edge in cfg["edges"]:
+        edges.append((int(edge["source"]), int(edge["target"]), edge.get("kind", "cfg")))
+    roots = [int(r) for r in cfg.get("roots", [])]
+    sinks = []
+    for sink in cfg.get("sinks", []):
+        sinks.append(
+            {
+                "block_address": int(sink["block_address"]),
+                "callsite_address": int(sink["callsite_address"]),
+                "sink_address": int(sink["sink_address"]),
+                "sink_name": sink.get("sink_name", ""),
+            }
+        )
+    return {
+        "node_by_addr": node_by_addr,
+        "edges": edges,
+        "roots": roots,
+        "sinks": sinks,
+        "schema_version": cfg.get("schema_version", 1),
+    }
+
+
+def _build_cfg_graph(cfg_data) -> nx.DiGraph:
+    """Build a real-CFG DiGraph from loaded sink_cfg.json data."""
+    graph = nx.DiGraph()
+    for addr in cfg_data["node_by_addr"]:
+        graph.add_node(addr)
+    for source, target, _kind in cfg_data["edges"]:
+        graph.add_edge(source, target, weight=1.0)
+    return graph
+
+
+def _compute_scores_by_cfg(cfg_data, distance_weight: float):
+    """Compute proximity/depth scores on the real CFG (plan §5.3-5.4).
+
+    - distance_to_sink: multi-source Dijkstra from all sink blocks on the
+      reversed graph (shortest number of edges to the nearest sink).
+    - proximity(n) = 1 / (1 + raw_distance(n))  -- so nearer is higher.
+    - depth: multi-source Dijkstra from roots on the original graph.
+    - score(n) = depth_norm(n) + w * proximity(n).
+    """
+    graph = _build_cfg_graph(cfg_data)
+
+    reverse_graph = graph.reverse(copy=False)
+    sink_blocks = [s["block_address"] for s in cfg_data["sinks"]]
+    sink_blocks = [s for s in sink_blocks if s in graph]
+    sink_blocks = list(dict.fromkeys(sink_blocks))
+
+    per_sink_maps = {}
+    for sink in sink_blocks:
+        per_sink_maps[sink] = nx.single_source_dijkstra_path_length(
+            reverse_graph, sink, weight="weight"
+        )
+
+    distance_to_sink = {}
+    nearest_sink_of = {}
+    for sink, dist_map in per_sink_maps.items():
+        for node, dist in dist_map.items():
+            current = distance_to_sink.get(node)
+            if current is None or dist < current:
+                distance_to_sink[node] = dist
+                nearest_sink_of[node] = sink
+
+    depth = {}
+    for root in cfg_data["roots"]:
+        if root not in graph:
+            continue
+        depth_map = nx.single_source_dijkstra_path_length(graph, root, weight="weight")
+        for node, dist in depth_map.items():
+            current = depth.get(node)
+            if current is None or dist > current:
+                depth[node] = dist
+
+    if depth:
+        max_depth = max(depth.values())
+    else:
+        max_depth = 1.0
+    if max_depth <= 0:
+        max_depth = 1.0
+
+    rows = []
+    reachable_count = 0
+    for addr, node in sorted(cfg_data["node_by_addr"].items()):
+        raw_distance = distance_to_sink.get(addr)
+        if raw_distance is None:
+            continue
+        reachable_count += 1
+        proximity = 1.0 / (1.0 + float(raw_distance))
+        depth_value = float(depth.get(addr, 0.0))
+        depth_norm = depth_value / max_depth
+        score = depth_norm + distance_weight * proximity
+        rows.append(
+            {
+                "node": addr,
+                "end_address": int(node.get("end_address", addr)),
+                "nearest_sink": nearest_sink_of.get(addr, 0),
+                "depth": depth_value,
+                "normalized_depth": round(depth_norm, 6),
+                "distance_to_sink": float(raw_distance),
+                "sink_proximity": round(proximity, 6),
+                "score": round(score, 6),
+            }
+        )
+
+    rows.sort(key=lambda item: item["score"], reverse=True)
+    return rows, reachable_count, len(cfg_data["node_by_addr"])
+
+
+def _write_score_table(output_dir: str, rows: List[Dict[str, float]], cfg_source: str = "pseudo", distance_weight: float = 1.0, node_count: int = 0, reachable_count: int = 0) -> Tuple[str, str]:
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, "sink_distance_scores.json")
     csv_path = os.path.join(output_dir, "sink_distance_scores.csv")
 
+    # Metadata-object output (plan §5.5); the fuzzer loader also accepts the
+    # legacy top-level array, so we keep the object for the paper experiment.
+    payload = {
+        "schema_version": 1,
+        "cfg_source": cfg_source,
+        "distance_weight": distance_weight,
+        "node_count": node_count if node_count else len(rows),
+        "reachable_node_count": reachable_count if reachable_count else len(rows),
+        "scores": rows,
+    }
+
     with open(json_path, "w", encoding="utf-8") as file:
-        json.dump(rows, file, indent=2, ensure_ascii=False)
+        json.dump(payload, file, indent=2, ensure_ascii=False)
 
     with open(csv_path, "w", encoding="utf-8", newline="") as file:
         writer = csv.writer(file)
-        writer.writerow(["region_id", "node", "nearest_sink", "depth", "distance_to_sink", "w", "score"])
+        writer.writerow(
+            ["node", "nearest_sink", "depth", "distance_to_sink", "normalized_depth", "sink_proximity", "score"]
+        )
         for item in rows:
             writer.writerow(
                 [
-                    item["region_id"],
                     hex(int(item["node"])),
                     hex(int(item["nearest_sink"])),
                     item["depth"],
                     item["distance_to_sink"],
-                    item["w"],
+                    item.get("normalized_depth", ""),
+                    item.get("sink_proximity", ""),
                     item["score"],
                 ]
             )
 
     return json_path, csv_path
+
+
+def _print_top_rows(rows, limit=10):
+    """Print the top-scoring nodes as a hex address table."""
+    print("[+] Top {0} high-priority nodes:".format(min(limit, len(rows))))
+    for item in rows[:limit]:
+        print(
+            "    node={} sink={} depth={} dis={} prox={} score={}".format(
+                hex(int(item["node"])),
+                hex(int(item["nearest_sink"])),
+                item["depth"],
+                item["distance_to_sink"],
+                item.get("sink_proximity", ""),
+                round(item["score"], 4),
+            )
+        )
 
 
 def main():
@@ -261,6 +413,22 @@ def main():
         "--sink-scope",
         default="sink_scope_addr.txt",
         help="Path to sink scope range file generated by Get_SinkFunc.py",
+    )
+    parser.add_argument(
+        "--cfg",
+        default=None,
+        help="Path to real-CFG sink_cfg.json (preferred source; enables proximity scoring)",
+    )
+    parser.add_argument(
+        "--distance-weight",
+        type=float,
+        default=1.0,
+        help="Weight multiplier w on sink proximity in score (default: 1.0)",
+    )
+    parser.add_argument(
+        "--allow-pseudo-cfg",
+        action="store_true",
+        help="Enable pseudo-CFG fallback built from address ranges (paper experiments must use --cfg)",
     )
     parser.add_argument(
         "--block-step",
@@ -277,20 +445,50 @@ def main():
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Directory to save score tables (default: same directory as --sink-scope)",
+        help="Directory to save score tables (default: same directory as --cfg / --sink-scope)",
     )
     args = parser.parse_args()
 
-    sink_ranges = _parse_sink_scope_ranges(args.sink_scope)
-
-    # Determine output directory: if user provided --output-dir use it,
-    # otherwise place outputs in the same directory as the sink-scope file.
+    # Determine output directory: --output-dir wins, else next to input.
     if args.output_dir:
         output_dir = args.output_dir
     else:
-        sink_scope_dir = os.path.dirname(os.path.abspath(args.sink_scope))
-        output_dir = sink_scope_dir if sink_scope_dir else "."
+        base = args.cfg or args.sink_scope
+        base_dir = os.path.dirname(os.path.abspath(base))
+        output_dir = base_dir if base_dir else "."
 
+    cfg_data = _load_cfg(args.cfg) if args.cfg else None
+    if cfg_data is not None:
+        rows, reachable_count, node_count = _compute_scores_by_cfg(
+            cfg_data, max(args.distance_weight, 0.0)
+        )
+        json_path, csv_path = _write_score_table(
+            output_dir,
+            rows,
+            cfg_source="ida",
+            distance_weight=max(args.distance_weight, 0.0),
+            node_count=node_count,
+            reachable_count=reachable_count,
+        )
+        print(f"[+] Real CFG loaded (schema v{cfg_data['schema_version']})")
+        print(f"[+] Nodes={node_count} reachable_to_sink={reachable_count} "
+              f"w={args.distance_weight}")
+        print(f"[+] Score rows: {len(rows)}")
+        print(f"[+] JSON: {json_path}")
+        print(f"[+] CSV : {csv_path}")
+        _print_top_rows(rows)
+        return
+
+    if not args.allow_pseudo_cfg:
+        print(
+            "[!] No --cfg provided (or sink_cfg.json unreadable) and --allow-pseudo-cfg "
+            "not set; writing empty score table. Use --cfg for real proximity scores."
+        )
+        json_path, csv_path = _write_score_table(output_dir, [], cfg_source="pseudo")
+        print(f"[+] Empty score tables written to: {json_path}, {csv_path}")
+        return
+
+    sink_ranges = _parse_sink_scope_ranges(args.sink_scope)
     if not sink_ranges:
         print(f"[!] No sink ranges found in {args.sink_scope}")
         json_path, csv_path = _write_score_table(output_dir, [])
@@ -299,26 +497,14 @@ def main():
 
     pr_regions, pr_region_exits, graph = _build_pseudo_cfg_from_ranges(sink_ranges, max(args.block_step, 1))
     rows, w = _compute_scores_by_paper(pr_regions, pr_region_exits, graph, max(args.indirect_edges, 0))
-    json_path, csv_path = _write_score_table(output_dir, rows)
+    json_path, csv_path = _write_score_table(output_dir, rows, cfg_source="pseudo")
 
     print(f"[+] Sink ranges loaded: {len(sink_ranges)}")
-    print(f"[+] CFG nodes={graph.number_of_nodes()} edges={graph.number_of_edges()} w={w}")
+    print(f"[+] Pseudo-CFG nodes={graph.number_of_nodes()} edges={graph.number_of_edges()} w={w}")
     print(f"[+] Score rows: {len(rows)}")
     print(f"[+] JSON: {json_path}")
     print(f"[+] CSV : {csv_path}")
-
-    if rows:
-        print("[+] Top 10 high-priority nodes:")
-        for item in rows[:10]:
-            print(
-                "    node={} sink={} depth={} dis={} score={}".format(
-                    hex(int(item["node"])),
-                    hex(int(item["nearest_sink"])),
-                    item["depth"],
-                    item["distance_to_sink"],
-                    round(item["score"], 4),
-                )
-            )
+    _print_top_rows(rows)
 
 
 if __name__ == "__main__":

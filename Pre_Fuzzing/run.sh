@@ -81,8 +81,15 @@ run_step "地址范围提取(Get_SinkFunc.py)" \
   "$IDAT_BIN" -A -Lida_sinks.log -S"$SCRIPT_DIR/Get_SinkFunc.py" "$TARGET_BINARY"
 
 # 4) 距离计算
-run_step "距离计算(Distance.py)" \
-  "$PYTHON_BIN" "$SCRIPT_DIR/Distance.py" --sink-scope "$BINARY_DIR/sink_scope_addr.txt"
+# Preferred: real CFG exported by Get_SinkFunc.py (step 3). Falls back to the
+# merged address-range pseudo CFG only when sink_cfg.json is missing.
+if [ -f "$BINARY_DIR/sink_cfg.json" ]; then
+  run_step "距离计算(Distance.py, real CFG)" \
+    "$PYTHON_BIN" "$SCRIPT_DIR/Distance.py" --cfg "$BINARY_DIR/sink_cfg.json"
+else
+  run_step "距离计算(Distance.py, pseudo CFG fallback)" \
+    "$PYTHON_BIN" "$SCRIPT_DIR/Distance.py" --sink-scope "$BINARY_DIR/sink_scope_addr.txt" --allow-pseudo-cfg
+fi
 
 echo ""
 echo "[+] Pre-fuzzing pipeline finished."

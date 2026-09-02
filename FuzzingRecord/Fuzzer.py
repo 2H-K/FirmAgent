@@ -329,6 +329,21 @@ def main():
     parser.add_argument("--taint-tag", default="taint_tag", help="Tag string injected to every parameter")
     parser.add_argument("--tag-mode", default="constant", choices=["constant", "unique"],
                         help="'constant' (default): same tag for all requests; 'unique': {tag}_{seq} per request")
+    # Feedback-guided greybox options (plan section 6.2). Full feedback is only
+    # enabled when BOTH --distance-file and --qemu-log are present; otherwise the
+    # legacy basic per-API/per-parameter traversal runs unchanged (section 11).
+    parser.add_argument("--distance-file", default=None,
+                        help="Path to sink_distance_scores.json (metadata object or legacy array)")
+    parser.add_argument("--qemu-log", default=None,
+                        help="Path to the QEMU basic-block exec log (host-side shared log)")
+    parser.add_argument("--feedback-settle", type=float, default=0.3,
+                        help="Seconds to wait after a response before slicing the trace window (default: 0.3)")
+    parser.add_argument("--iterations", type=int, default=1000,
+                        help="Max guided-fuzzing iterations (default: 1000)")
+    parser.add_argument("--random-seed", type=int, default=None,
+                        help="Seed for reproducible seed selection (default: None)")
+    parser.add_argument("--dictionary-file", default=None,
+                        help="AFL-style dictionary file (name=\"value\" or \"value\") for value mutation")
     args = parser.parse_args()
 
     if args.host.startswith("http://") or args.host.startswith("https://"):
@@ -340,7 +355,43 @@ def main():
 
     fuzzer = APIFuzzer(base_url, args.json_file, args.delay, host_header, args.taint_tag, args.tag_mode)
     fuzzer.method = args.method
-    fuzzer.run_fuzzing()
+
+    guided = args.distance_file is not None and args.qemu_log is not None
+    if guided:
+        from feedback_fuzzing import (  # same-directory module (section 9)
+            DistanceIndex,
+            GuidedFuzzer,
+            MutationDictionary,
+            TraceWindowReader,
+        )
+
+        distance_index = DistanceIndex(args.distance_file)
+        trace_reader = TraceWindowReader(args.qemu_log, settle=args.feedback_settle)
+        try:
+            with open(args.json_file, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+        except Exception:
+            json_data = {}
+        dictionary = MutationDictionary.from_json(json_data, args.dictionary_file)
+        guided_fuzzer = GuidedFuzzer(
+            fuzzer,
+            distance_index,
+            trace_reader,
+            iteration_limit=max(args.iterations, 1),
+            random_seed=args.random_seed,
+            dictionary=dictionary,
+            tag_mode=args.tag_mode,
+            delay=args.delay,
+            method=args.method,
+        )
+        fuzzer.logger.info(
+            "Enabled feedback-guided greybox mode: distance file + QEMU log present"
+        )
+        guided_fuzzer.run_fuzzing()
+    else:
+        # Legacy behavior: basic per-API taint traversal with no trace feedback.
+        fuzzer.logger.info("Running legacy basic traversal (no distance/trace feedback)")
+        fuzzer.run_fuzzing()
 
 
 if __name__ == '__main__':

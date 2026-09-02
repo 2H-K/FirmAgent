@@ -225,6 +225,11 @@ The pre-fuzzing pipeline (`Pre_Fuzzing/run.sh`) automates the following steps:
    - Prioritizes fuzzing targets closer to dangerous sinks
    - Outputs `sink_distance_scores.json` / `sink_distance_scores.csv`
 
+**Real-CFG artifacts (schema v1):** `Get_SinkFunc.py` now also exports the actual control-flow graph used by step 4:
+
+- `sink_cfg.json` — nodes (basic blocks with `address`/`end_address`/`function_*`/`is_function_entry`), edges (`kind: cfg|call|indirect_call`, `weight:1.0`), `roots`, and sink records (`block_address`, `callsite_address`, `sink_address`, `sink_name`).
+- `sink_distance_scores.json` is written as a **metadata object** when `--cfg` is used: `{schema_version, cfg_source, distance_weight, node_count, reachable_node_count, scores[]}`. Distance is the shortest edge-count to the nearest sink block (`raw_distance`), with per-node `sink_proximity = 1/(1+raw_distance)` and `score = normalized_depth + distance_weight * proximity`.
+
 **Outputs:**
 
 - `Pre_fuzzing.json` - Complete fuzzing input schema (APIs + parameters)
@@ -283,6 +288,41 @@ export QEMU_LOG_FILENAME=/scratch/qemu_trace.log
 
 > **Tip:** Derive `QEMU_DFILTER` ranges from `sink_scope_addr.txt` (output of Pre-Fuzzing step 3). Keep the total string under ~4 KB — very long ranges may prevent the binary from starting.
 
+**Keep the trace log small** — a whole-segment range such as `0x400000..0x406000` makes the log grow with wall-clock execution even while idle (a single 24/7 run produced an 878 GB trace). Two host-side helpers:
+
+```bash
+# 1) Tighten the range: normalize + merge legacy per-sink pairs into one compact string.
+python3 FuzzingRecord/make_dfilter.py sink_scope_addr.txt \
+    --out /tmp/dfilter.txt            # e.g. 359 ranges -> 0x405538..0x433EE8
+./FuzzingRecord/start_rehost.sh --container <name> \
+    --dfilter-file /tmp/dfilter.txt
+
+# 2) Bound the log: truncate in place when it exceeds the cap (safe: the fuzz
+#    loop treats truncation as feedback_valid=false). Run from cron, and reset
+#    the log before each fuzz session.
+python3 FuzzingRecord/cap_trace_log.py <shared>/qemu_trace.log \
+    --max-bytes 536870912             # 512 MiB cap; also: --action rotate, --reset
+```
+
+Best practice: run the instrumented httpd (instrumented QEMU) **only during active fuzz sessions**, reset the trace log at the start of each session, and stop it when idle — the trace log only needs to cover the per-request byte windows the sidecar samples.
+
+**Session-scoped running** — even with a tightened DFILTER the traced httpd
+grows the log while idle (measured: ~18 MB/s on the TEW-632BRP rehost), so the
+service must only be up during fuzzing. The session wrapper resets the log at
+session start AND stop:
+
+```bash
+FuzzingRecord/rehost_session.sh start --container <name> \
+    --dfilter "$(python3 FuzzingRecord/make_dfilter.py sink_scope_addr.txt)"
+# ... run Fuzzer.py / taint_monitor.py / build_source_json.py ...
+FuzzingRecord/rehost_session.sh stop --container <name>          # kill + reset log
+FuzzingRecord/rehost_session.sh status <name>                    # running? port?
+```
+
+`stop` kills the traced httpd **inside** the container (`docker exec ... kill
+-9` on the emulated PID; host-side kill of the root-owned qemu PID is not
+permitted), verifies the HTTP port dropped, and zeroes the trace log.
+
 #### Taint monitor (for exact join)
 
 Run the taint monitor sidecar **before** fuzzing so each trace window is attributed to its originating request:
@@ -339,6 +379,103 @@ python FuzzingRecord/Fuzzer.py \
 - `result.json` — Structured request packets and responses written by `FuzzingRecord/Fuzzer.py`
 - `result_stream.ndjson` — Per-request stream (only with `--tag-mode unique`); consumed by `taint_monitor.py`
 - `fuzzing_results.log` — Human-readable progress and warnings
+
+#### CFG-guided full-feedback mode (the default when distance + trace are present)
+
+Supply **both** the distance table and the QEMU trace log and `FuzzingRecord/Fuzzer.py` switches from the legacy per-API/per-parameter traversal to distance-guided greybox fuzzing (`FuzzingRecord/feedback_fuzzing.py`):
+
+```bash
+python3 FuzzingRecord/Fuzzer.py \
+  --json-file Pre_fuzzing.json \
+  --delay 0.5 \
+  --host {container_ip} \
+  --distance-file {binary_dir}/sink_distance_scores.json \
+  --qemu-log /host/shared/qemu_trace.log \
+  --feedback-settle 0.3 \
+  --iterations 1000 \
+  --random-seed 12345 \
+  --dictionary-file /path/to/generic.dict \
+  --tag-mode unique
+```
+
+- `--distance-file` — `sink_distance_scores.json` from `Pre_Fuzzing/Distance.py --cfg` (accepts the §5.5 metadata object or the legacy top-level array).
+- `--qemu-log` — the instrumented QEMU exec log (shared volume from `start_rehost.sh`).
+- `--feedback-settle` — seconds to wait after a response before slicing the trace window (default 0.3).
+- `--iterations` — guided-fuzzing budget (default 1000).
+- `--random-seed` — reproducible seed selection (deterministic corpus + RNG; omit for fresh runs).
+- `--dictionary-file` — optional AFL-style dictionary (`name="value"` / `"value"`, `#` comments).
+
+**When is feedback valid?** Each request records the QEMU log byte offset before sending and slices `[start,end)` after settle. Truncation, rotation (inode change) or a missing log makes that window `feedback_valid:false`; those iterations still run dictionary-driven mutation and never abort the loop — greybox metrics are only reported when the trace is trusted.
+
+**Corpus and feedback fields.** Interesting inputs enter the corpus on new edges/blocks, on distance-to-sink improvement, on a score gain over the parent, or on an HTTP anomaly. Every `result.json`/`result_stream.ndjson` entry gains a `feedback` object:
+
+```json
+{
+  "request_id": 42,
+  "seed_id": 7,
+  "parent_seed_id": 3,
+  "generation": 2,
+  "mutation": "parameter_dictionary_replace",
+  "feedback": {
+    "valid": true,
+    "trace_block_count": 124,
+    "trace_edge_count": 101,
+    "new_blocks": 0,
+    "new_edges": 3,
+    "min_distance_to_sink": 1.0,
+    "max_target_score": 0.5,
+    "distance_improved": false,
+    "coverage_improved": true
+  }
+}
+```
+
+**Mutation dictionary in `Pre_fuzzing.json`.** The fuzzer reads `dictionary.global_values` and `dictionary.parameter_values` when present; token priority is parameter-specific > JSON global > external `--dictionary-file` > builtin boundary values:
+
+```json
+{
+  "api_endpoints": ["/apply.cgi"],
+  "para": ["action", "mode"],
+  "dictionary": {
+    "global_values": ["0", "1", "true", "false", "enable", "disable"],
+    "parameter_values": { "action": ["apply", "save", "reboot", "restore"] }
+  }
+}
+```
+
+Every value template keeps `{tag}` (e.g. `{tag}`, `{value}{tag}`, `{tag}{value}`, `{value}:{tag}`) so the taint value stays traceable downstream; `{value}` is filled at mutation time and `{tag}` is resolved with a unique per-send tag right before sending.
+
+**`fuzzing_summary.json`** (written next to `result.json`) records the run:
+
+```json
+{
+  "schema_version": 1,
+  "duration_seconds": 83.2,
+  "total_executions": 1000,
+  "valid_feedback_count": 998,
+  "cumulative_blocks": 412,
+  "cumulative_edges": 508,
+  "corpus_size": 37,
+  "best_distance_to_sink": 0.0,
+  "selection": { "exploration": 200, "guided": 800 },
+  "mutation_operators": {
+    "parameter_dictionary_replace": { "executions": 166, "interesting": 4 },
+    "param_value_rotate":       { "executions": 167, "interesting": 5 },
+    "switch_taint_param":       { "executions": 166, "interesting": 6 },
+    "tag_one_target":           { "executions": 167, "interesting": 2 },
+    "boundary_mutation":        { "executions": 167, "interesting": 9 },
+    "local_mutation":           { "executions": 167, "interesting": 1 }
+  },
+  "distance_index": {
+    "schema_version": 1,
+    "cfg_source": "ida",
+    "distance_weight": 1.0,
+    "node_count": 11
+  }
+}
+```
+
+**Distance semantics.** `distance_to_sink` is the shortest (unweighted) path length over the real CFG to the nearest sink block; `sink_proximity = 1 / (1 + distance_to_sink)` so nearer is higher; `score = normalized_depth + distance_weight * proximity` (`--distance-weight`, default 1.0). Proximity (never raw distance) is what the guided selector uses for its distance term — they are the two different quantities the plan calls `dis(s)` and `raw distance`.
 
 ### 4) Taint-to-PoC Agent
 
@@ -399,6 +536,7 @@ Legacy array-of-objects input is still partially supported for endpoint extracti
 - **`result.json`** — Structured request packets and responses emitted by `FuzzingRecord/Fuzzer.py`.
 - **`result_stream.ndjson`** — Per-request stream (only with `--tag-mode unique`); one JSON line per request with `request_id`, `sent_at`, etc.
 - **`trace_windows.jsonl`** — Produced by `taint_monitor.py`; maps each request to its byte window in the QEMU log.
+- **`fuzzing_summary.json`** — Run summary written by full-feedback mode: executions, valid-feedback count, cumulative blocks/edges, corpus size, best distance, selection split, mutation-operator yields, and distance-index metadata.
 - **`Source.json`** — Source addresses and their corresponding reachable test cases (required for taint analysis). Generated by `build_source_json.py` from the QEMU trace log.
 - **`Indirect_call.json`** / **`indirect_data.json`** (optional) — Caller-callee pairs for indirect call resolution.
 
